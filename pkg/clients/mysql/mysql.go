@@ -23,6 +23,8 @@ import (
 
 const (
 	errNotSupported = "%s not supported by mysql client"
+
+	errCleartextRequiresTLS = `allowCleartextPasswords requires tls to be "true", "skip-verify", or "custom" — "preferred" (including the unset default) permits an unencrypted fallback connection`
 )
 
 // ConnectionPoolConfig contains optional connection-pool tuning for the
@@ -133,6 +135,24 @@ func resetPoolCacheForTest() {
 	}
 }
 
+// ValidateAllowCleartextPasswords rejects allowCleartextPasswords=true
+// unless tls resolves to a mode that guarantees an encrypted connection.
+// "preferred" (and the unset default, which resolves to "preferred") may
+// silently fall back to an unencrypted connection, which would send the
+// password in cleartext over the network — defeating the point of the
+// driver's opt-in safety guard. tls should be the resolved value returned
+// by tls.LoadConfig, not the raw ProviderConfig field, so that tls=custom
+// (resolved to a registered config name) is correctly treated as encrypted.
+func ValidateAllowCleartextPasswords(tls *string, allowCleartextPasswords *bool) error {
+	if allowCleartextPasswords == nil || !*allowCleartextPasswords {
+		return nil
+	}
+	if tls == nil || *tls == "preferred" {
+		return errors.New(errCleartextRequiresTLS)
+	}
+	return nil
+}
+
 type mySQLDB struct {
 	db       *sql.DB
 	openErr  error // sticky error from initial pool open, returned by Exec/Query/Scan
@@ -143,10 +163,10 @@ type mySQLDB struct {
 }
 
 // New returns a MySQL database client. Equivalent to NewWithConfig with
-// a nil config. Preserved for backward compatibility with existing
-// callers; new code should prefer NewWithConfig.
+// a nil config and no cleartext-password override. Preserved for backward
+// compatibility with existing callers; new code should prefer NewWithConfig.
 func New(creds map[string][]byte, tls *string, binlog *bool) xsql.DB {
-	return NewWithConfig(creds, tls, binlog, nil)
+	return NewWithConfig(creds, tls, binlog, nil, nil)
 }
 
 // NewWithConfig returns a MySQL database client backed by a process-wide
@@ -160,7 +180,12 @@ func New(creds map[string][]byte, tls *string, binlog *bool) xsql.DB {
 // no dial timeout). Provide a ConnectionPoolConfig to bound the pool
 // — see upstream issues #110, #195, #220 for the failure modes the
 // defaults can cause under load.
-func NewWithConfig(creds map[string][]byte, tls *string, binlog *bool, cfg *ConnectionPoolConfig) xsql.DB {
+//
+// allowCleartextPasswords opts into sending the password in cleartext
+// when the server requests an auth method that requires it (e.g. AWS
+// RDS/Aurora's AWSAuthenticationPlugin for IAM database authentication).
+// See ValidateAllowCleartextPasswords for the TLS requirement this implies.
+func NewWithConfig(creds map[string][]byte, tls *string, binlog *bool, cfg *ConnectionPoolConfig, allowCleartextPasswords *bool) xsql.DB {
 	endpoint := string(creds[xpv1.ResourceCredentialsSecretEndpointKey])
 	port := string(creds[xpv1.ResourceCredentialsSecretPortKey])
 	username := string(creds[xpv1.ResourceCredentialsSecretUserKey])
@@ -173,7 +198,7 @@ func NewWithConfig(creds map[string][]byte, tls *string, binlog *bool, cfg *Conn
 	if cfg != nil {
 		dialTimeout = cfg.DialTimeout
 	}
-	dsn := dsnWithTimeout(username, password, endpoint, port, *tls, binlog, dialTimeout)
+	dsn := dsnWithTimeout(username, password, endpoint, port, *tls, binlog, dialTimeout, allowCleartextPasswords)
 
 	db, err := getOrOpenPool(dsn, cfg)
 	return mySQLDB{
@@ -186,10 +211,11 @@ func NewWithConfig(creds map[string][]byte, tls *string, binlog *bool, cfg *Conn
 	}
 }
 
-// DSN returns the DSN URL with no dial timeout. Preserved for backward
-// compatibility; new code should call DSNWithDialTimeout.
+// DSN returns the DSN URL with no dial timeout and no cleartext-password
+// override. Preserved for backward compatibility; new code should call
+// DSNWithDialTimeout or, for full control, dsnWithTimeout directly.
 func DSN(username, password, endpoint, port, tls string, binlog *bool) string {
-	return dsnWithTimeout(username, password, endpoint, port, tls, binlog, 0)
+	return dsnWithTimeout(username, password, endpoint, port, tls, binlog, 0, nil)
 }
 
 // DSNWithDialTimeout returns the DSN URL with an optional dial timeout
@@ -197,10 +223,10 @@ func DSN(username, password, endpoint, port, tls string, binlog *bool) string {
 // dialTimeout omits the parameter, leaving the driver default (no
 // timeout) in place.
 func DSNWithDialTimeout(username, password, endpoint, port, tls string, binlog *bool, dialTimeout time.Duration) string {
-	return dsnWithTimeout(username, password, endpoint, port, tls, binlog, dialTimeout)
+	return dsnWithTimeout(username, password, endpoint, port, tls, binlog, dialTimeout, nil)
 }
 
-func dsnWithTimeout(username, password, endpoint, port, tls string, binlog *bool, dialTimeout time.Duration) string {
+func dsnWithTimeout(username, password, endpoint, port, tls string, binlog *bool, dialTimeout time.Duration, allowCleartextPasswords *bool) string {
 	var extra []string
 	if binlog != nil {
 		extra = append(extra, "sql_log_bin="+strconv.FormatBool(*binlog))
@@ -209,6 +235,9 @@ func dsnWithTimeout(username, password, endpoint, port, tls string, binlog *bool
 		// go-sql-driver accepts Go duration strings (e.g. "10s", "1m")
 		// and turns them into the underlying net.Dialer Timeout.
 		extra = append(extra, "timeout="+dialTimeout.String())
+	}
+	if allowCleartextPasswords != nil {
+		extra = append(extra, "allowCleartextPasswords="+strconv.FormatBool(*allowCleartextPasswords))
 	}
 	base := fmt.Sprintf("%s:%s@tcp(%s:%s)/?tls=%s",
 		username, password, endpoint, port, tls)

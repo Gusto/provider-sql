@@ -52,6 +52,18 @@ type ProviderConfigSpec struct {
 	// produce under load.
 	// +optional
 	ConnectionPool *ConnectionPoolSpec `json:"connectionPool,omitempty"`
+
+	// AllowCleartextPasswords permits sending the password to the server in
+	// cleartext, within whatever transport the tls field provides, when the
+	// server requests an authentication method the driver only supports
+	// this way (for example AWS RDS/Aurora's AWSAuthenticationPlugin, used
+	// for IAM database authentication). Defaults to false, matching the
+	// underlying go-sql-driver default. Requires tls to be set to "true",
+	// "skip-verify", or "custom" — the unset default and "preferred" both
+	// permit falling back to an unencrypted connection, which would send
+	// the password in cleartext over the network.
+	// +optional
+	AllowCleartextPasswords *bool `json:"allowCleartextPasswords,omitempty"`
 }
 
 // ConnectionPoolSpec tunes the database/sql connection pool the provider

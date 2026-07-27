@@ -97,6 +97,73 @@ func TestDSNDialTimeout(t *testing.T) {
 	}
 }
 
+func TestDSNAllowCleartextPasswords(t *testing.T) {
+	endpoint := "endpoint"
+	port := "3306"
+	user := "username"
+	rawPass := "password^"
+	tls := "true"
+	allow := true
+	dsn := dsnWithTimeout(user, rawPass, endpoint, port, tls, nil, 0, &allow)
+	want := fmt.Sprintf("%s:%s@tcp(%s:%s)/?tls=%s&allowCleartextPasswords=%s",
+		user, rawPass, endpoint, port, tls, strconv.FormatBool(allow))
+	if dsn != want {
+		t.Errorf("DSN string did not include allowCleartextPasswords: got %q, want %q", dsn, want)
+	}
+}
+
+func TestDSNAllowCleartextPasswordsAndBinLog(t *testing.T) {
+	endpoint := "endpoint"
+	port := "3306"
+	user := "username"
+	rawPass := "password^"
+	tls := "true"
+	binlog := true
+	allow := true
+	dsn := dsnWithTimeout(user, rawPass, endpoint, port, tls, &binlog, 0, &allow)
+	want := fmt.Sprintf("%s:%s@tcp(%s:%s)/?tls=%s&sql_log_bin=%s&allowCleartextPasswords=%s",
+		user, rawPass, endpoint, port, tls, strconv.FormatBool(binlog), strconv.FormatBool(allow))
+	if dsn != want {
+		t.Errorf("DSN string did not match expected output with binlog and allowCleartextPasswords: got %q, want %q", dsn, want)
+	}
+}
+
+func TestValidateAllowCleartextPasswords(t *testing.T) {
+	trueVal := true
+	falseVal := false
+	tlsTrue := "true"
+	tlsSkipVerify := "skip-verify"
+	tlsCustom := "custom-my-provider-config"
+	tlsPreferred := "preferred"
+
+	cases := map[string]struct {
+		tls     *string
+		allow   *bool
+		wantErr bool
+	}{
+		"nil allow, nil tls":          {tls: nil, allow: nil, wantErr: false},
+		"false allow, nil tls":        {tls: nil, allow: &falseVal, wantErr: false},
+		"true allow, nil tls":         {tls: nil, allow: &trueVal, wantErr: true},
+		"true allow, preferred tls":   {tls: &tlsPreferred, allow: &trueVal, wantErr: true},
+		"true allow, true tls":        {tls: &tlsTrue, allow: &trueVal, wantErr: false},
+		"true allow, skip-verify tls": {tls: &tlsSkipVerify, allow: &trueVal, wantErr: false},
+		"true allow, custom-* tls":    {tls: &tlsCustom, allow: &trueVal, wantErr: false},
+		"false allow, preferred tls":  {tls: &tlsPreferred, allow: &falseVal, wantErr: false},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateAllowCleartextPasswords(tc.tls, tc.allow)
+			if tc.wantErr && err == nil {
+				t.Errorf("expected an error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("expected no error, got %v", err)
+			}
+		})
+	}
+}
+
 // TestNewWithConfigAppliesPoolSettings verifies that pool tuning passed
 // through NewWithConfig reaches the underlying *sql.DB. We check via
 // db.Stats(), which surfaces the configured limits.
@@ -119,7 +186,7 @@ func TestNewWithConfigAppliesPoolSettings(t *testing.T) {
 		DialTimeout:     10 * time.Second,
 	}
 
-	db := NewWithConfig(creds, &tls, nil, cfg)
+	db := NewWithConfig(creds, &tls, nil, cfg, nil)
 	mdb, ok := db.(mySQLDB)
 	if !ok {
 		t.Fatalf("expected mySQLDB, got %T", db)
@@ -158,7 +225,7 @@ func TestNewWithConfigNilUsesDriverDefaults(t *testing.T) {
 	}
 	tls := "preferred"
 
-	db := NewWithConfig(creds, &tls, nil, nil)
+	db := NewWithConfig(creds, &tls, nil, nil, nil)
 	mdb, ok := db.(mySQLDB)
 	if !ok {
 		t.Fatalf("expected mySQLDB, got %T", db)
@@ -189,8 +256,8 @@ func TestPoolCacheReuse(t *testing.T) {
 	}
 	tls := "preferred"
 
-	db1 := NewWithConfig(creds, &tls, nil, nil).(mySQLDB)
-	db2 := NewWithConfig(creds, &tls, nil, nil).(mySQLDB)
+	db1 := NewWithConfig(creds, &tls, nil, nil, nil).(mySQLDB)
+	db2 := NewWithConfig(creds, &tls, nil, nil, nil).(mySQLDB)
 	if db1.db != db2.db {
 		t.Errorf("expected pool cache to return the same *sql.DB for identical credentials; got distinct instances")
 	}
@@ -217,8 +284,8 @@ func TestPoolCacheDistinctDSN(t *testing.T) {
 		xpv1.ResourceCredentialsSecretPasswordKey: []byte("p"),
 	}
 
-	dbA := NewWithConfig(credsA, &tls, nil, nil).(mySQLDB)
-	dbB := NewWithConfig(credsB, &tls, nil, nil).(mySQLDB)
+	dbA := NewWithConfig(credsA, &tls, nil, nil, nil).(mySQLDB)
+	dbB := NewWithConfig(credsB, &tls, nil, nil, nil).(mySQLDB)
 	if dbA.db == dbB.db {
 		t.Errorf("expected distinct *sql.DB for different DSNs; got the same instance")
 	}
@@ -226,7 +293,7 @@ func TestPoolCacheDistinctDSN(t *testing.T) {
 
 // TestNewBackwardCompatible verifies that the unchanged New signature
 // still returns a working client. Callers that don't opt into pool
-// tuning get behavior equivalent to NewWithConfig(..., nil).
+// tuning get behavior equivalent to NewWithConfig(..., nil, nil).
 func TestNewBackwardCompatible(t *testing.T) {
 	defer resetPoolCacheForTest()
 	resetPoolCacheForTest()

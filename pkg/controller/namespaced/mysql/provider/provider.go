@@ -23,16 +23,18 @@ type ProviderInfo struct {
 	// ConnectionPool is the pool tuning carried from whichever
 	// ProviderConfig kind (namespaced or cluster) was referenced.
 	// nil preserves database/sql defaults.
-	ConnectionPool *v1alpha1.ConnectionPoolSpec
+	ConnectionPool          *v1alpha1.ConnectionPoolSpec
+	AllowCleartextPasswords *bool
 }
 
 func GetProviderConfig(ctx context.Context, kube client.Client, mg resource.ModernManaged) (ProviderInfo, error) {
 	var (
-		secretKey   *client.ObjectKey
-		tlsMode     *string
-		tlsConfig   *v1alpha1.TLSConfig
-		keyMapping  map[string]string
-		connectionPool *v1alpha1.ConnectionPoolSpec
+		secretKey               *client.ObjectKey
+		tlsMode                 *string
+		tlsConfig               *v1alpha1.TLSConfig
+		connectionPool          *v1alpha1.ConnectionPoolSpec
+		allowCleartextPasswords *bool
+		keyMapping              map[string]string
 	)
 
 	switch mg.GetProviderConfigReference().Kind {
@@ -54,6 +56,7 @@ func GetProviderConfig(ctx context.Context, kube client.Client, mg resource.Mode
 		}
 		tlsMode = providerConfig.Spec.TLS
 		tlsConfig = providerConfig.Spec.TLSConfig
+		allowCleartextPasswords = providerConfig.Spec.AllowCleartextPasswords
 		keyMapping = providerConfig.Spec.Credentials.SecretKeyMapping.ToMap()
 		connectionPool = providerConfig.Spec.ConnectionPool
 
@@ -74,6 +77,7 @@ func GetProviderConfig(ctx context.Context, kube client.Client, mg resource.Mode
 		}
 		tlsMode = clusterProviderConfig.Spec.TLS
 		tlsConfig = clusterProviderConfig.Spec.TLSConfig
+		allowCleartextPasswords = clusterProviderConfig.Spec.AllowCleartextPasswords
 		keyMapping = clusterProviderConfig.Spec.Credentials.SecretKeyMapping.ToMap()
 		connectionPool = clusterProviderConfig.Spec.ConnectionPool
 
@@ -92,10 +96,11 @@ func GetProviderConfig(ctx context.Context, kube client.Client, mg resource.Mode
 	}
 
 	return ProviderInfo{
-		ProviderConfigName: mg.GetProviderConfigReference().Name,
-		SecretData:         xsql.RemapCredentialKeys(s.Data, keyMapping),
-		TLS:                tlsMode,
-		TLSConfig:          tlsConfig,
-		ConnectionPool:     connectionPool,
+		ProviderConfigName:      mg.GetProviderConfigReference().Name,
+		SecretData:              xsql.RemapCredentialKeys(s.Data, keyMapping),
+		TLS:                     tlsMode,
+		TLSConfig:               tlsConfig,
+		ConnectionPool:          connectionPool,
+		AllowCleartextPasswords: allowCleartextPasswords,
 	}, nil
 }

@@ -43,6 +43,7 @@ import (
 const (
 	errTrackPCUsage = "cannot track ProviderConfig usage"
 	errTLSConfig    = "cannot load TLS config"
+	errCleartext    = "invalid allowCleartextPasswords configuration"
 
 	errSelectDB = "cannot select database"
 	errCreateDB = "cannot create database"
@@ -90,7 +91,7 @@ func Setup(mgr ctrl.Manager, o xpcontroller.Options) error {
 type connector struct {
 	kube  client.Client
 	track func(ctx context.Context, mg resource.ModernManaged) error
-	newDB func(creds map[string][]byte, tls *string, binlog *bool, pool *mysql.ConnectionPoolConfig) xsql.DB
+	newDB func(creds map[string][]byte, tls *string, binlog *bool, pool *mysql.ConnectionPoolConfig, allowCleartextPasswords *bool) xsql.DB
 }
 
 var _ managed.TypedExternalConnector[*namespacedv1alpha1.Database] = &connector{}
@@ -111,10 +112,13 @@ func (c *connector) Connect(ctx context.Context, mg *namespacedv1alpha1.Database
 	if err != nil {
 		return nil, errors.Wrap(err, errTLSConfig)
 	}
+	if err := mysql.ValidateAllowCleartextPasswords(tlsName, providerInfo.AllowCleartextPasswords); err != nil {
+		return nil, errors.Wrap(err, errCleartext)
+	}
 
 	maxOpen, maxIdle, lifetime, idleTime, dialTimeout := providerInfo.ConnectionPool.ToPoolValues()
 	poolCfg := mysql.NewConnectionPoolConfig(maxOpen, maxIdle, lifetime, idleTime, dialTimeout)
-	return &external{db: c.newDB(providerInfo.SecretData, tlsName, mg.Spec.ForProvider.BinLog, poolCfg)}, nil
+	return &external{db: c.newDB(providerInfo.SecretData, tlsName, mg.Spec.ForProvider.BinLog, poolCfg, providerInfo.AllowCleartextPasswords)}, nil
 }
 
 type external struct{ db xsql.DB }

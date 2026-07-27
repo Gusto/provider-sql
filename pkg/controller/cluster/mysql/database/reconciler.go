@@ -47,6 +47,7 @@ const (
 	errNoSecretRef  = "ProviderConfig does not reference a credentials Secret"
 	errGetSecret    = "cannot get credentials Secret"
 	errTLSConfig    = "cannot load TLS config"
+	errCleartext    = "invalid allowCleartextPasswords configuration"
 
 	errSelectDB = "cannot select database"
 	errCreateDB = "cannot create database"
@@ -94,7 +95,7 @@ func Setup(mgr ctrl.Manager, o xpcontroller.Options) error {
 type connector struct {
 	kube  client.Client
 	track func(ctx context.Context, mg resource.LegacyManaged) error
-	newDB func(creds map[string][]byte, tls *string, binlog *bool, pool *mysql.ConnectionPoolConfig) xsql.DB
+	newDB func(creds map[string][]byte, tls *string, binlog *bool, pool *mysql.ConnectionPoolConfig, allowCleartextPasswords *bool) xsql.DB
 }
 
 var _ managed.TypedExternalConnector[*v1alpha1.Database] = &connector{}
@@ -129,11 +130,14 @@ func (c *connector) Connect(ctx context.Context, mg *v1alpha1.Database) (managed
 	if err != nil {
 		return nil, errors.Wrap(err, errTLSConfig)
 	}
+	if err := mysql.ValidateAllowCleartextPasswords(tlsName, pc.Spec.AllowCleartextPasswords); err != nil {
+		return nil, errors.Wrap(err, errCleartext)
+	}
 
 	secretData := xsql.RemapCredentialKeys(s.Data, pc.Spec.Credentials.SecretKeyMapping.ToMap())
 	maxOpen, maxIdle, lifetime, idleTime, dialTimeout := pc.Spec.ConnectionPool.ToPoolValues()
 	poolCfg := mysql.NewConnectionPoolConfig(maxOpen, maxIdle, lifetime, idleTime, dialTimeout)
-	return &external{db: c.newDB(secretData, tlsName, mg.Spec.ForProvider.BinLog, poolCfg)}, nil
+	return &external{db: c.newDB(secretData, tlsName, mg.Spec.ForProvider.BinLog, poolCfg, pc.Spec.AllowCleartextPasswords)}, nil
 }
 
 type external struct{ db xsql.DB }
