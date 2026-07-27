@@ -162,6 +162,32 @@ func TestConnect(t *testing.T) {
 			},
 			want: errors.Wrap(errBoom, errGetSecret),
 		},
+		"ErrCleartextRequiresTLS": {
+			reason: "An error should be returned if allowCleartextPasswords is true but tls doesn't guarantee an encrypted connection",
+			fields: fields{
+				kube: &test.MockClient{
+					MockGet: test.NewMockGetFn(nil, func(obj client.Object) error {
+						switch o := obj.(type) {
+						case *v1alpha1.ProviderConfig:
+							o.Spec.Credentials.ConnectionSecretRef = &xpv1.SecretReference{}
+							o.Spec.AllowCleartextPasswords = boolPtr(true)
+						}
+						return nil
+					}),
+				},
+				track: nopUsage,
+			},
+			args: args{
+				mg: &v1alpha1.Database{
+					Spec: v1alpha1.DatabaseSpec{
+						ResourceSpec: xpv1.ResourceSpec{
+							ProviderConfigReference: &xpv1.Reference{},
+						},
+					},
+				},
+			},
+			want: errors.Wrap(mysql.ValidateAllowCleartextPasswords(nil, boolPtr(true)), errCleartext),
+		},
 	}
 
 	for name, tc := range cases {
@@ -176,6 +202,8 @@ func TestConnect(t *testing.T) {
 }
 
 func ptrStr(s string) *string { return &s }
+
+func boolPtr(b bool) *bool { return &b }
 
 func mockScanRow(name, charset, collation string) func(ctx context.Context, q xsql.Query, dest ...interface{}) error {
 	return func(ctx context.Context, q xsql.Query, dest ...interface{}) error {

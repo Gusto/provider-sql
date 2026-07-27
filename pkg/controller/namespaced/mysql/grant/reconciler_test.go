@@ -223,6 +223,38 @@ func TestConnect(t *testing.T) {
 			},
 			want: provErrors.GetSecretError(errBoom),
 		},
+		"ErrCleartextRequiresTLS": {
+			reason: "An error should be returned if allowCleartextPasswords is true but tls doesn't guarantee an encrypted connection",
+			fields: fields{
+				kube: &test.MockClient{
+					MockGet: test.NewMockGetFn(nil, func(obj client.Object) error {
+						switch o := obj.(type) {
+						case *v1alpha1.ClusterProviderConfig:
+							o.Spec.Credentials.ConnectionSecretRef = common.SecretReference{
+								Name:      "example",
+								Namespace: "default",
+							}
+							o.Spec.AllowCleartextPasswords = boolPtr(true)
+						}
+						return nil
+					}),
+				},
+				track: func(ctx context.Context, mg resource.ModernManaged) error { return nil },
+			},
+			args: args{
+				mg: &v1alpha1.Grant{
+					Spec: v1alpha1.GrantSpec{
+						ManagedResourceSpec: xpv2.ManagedResourceSpec{
+							ProviderConfigReference: &common.ProviderConfigReference{
+								Kind: v1alpha1.ClusterProviderConfigKind,
+								Name: "example",
+							},
+						},
+					},
+				},
+			},
+			want: errors.Wrap(mysql.ValidateAllowCleartextPasswords(nil, boolPtr(true)), errCleartext),
+		},
 	}
 
 	for name, tc := range cases {
@@ -1256,6 +1288,8 @@ func Test_diffPermissions(t *testing.T) {
 		})
 	}
 }
+
+func boolPtr(b bool) *bool { return &b }
 
 func equateSlices() []cmp.Option {
 	return []cmp.Option{

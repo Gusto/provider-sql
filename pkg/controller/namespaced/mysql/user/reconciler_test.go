@@ -76,6 +76,8 @@ func (m mockDB) GetServerVersion(ctx context.Context) (int, error) {
 
 func ptrString(s string) *string { return &s }
 
+func boolPtr(b bool) *bool { return &b }
+
 func TestConnect(t *testing.T) {
 	errBoom := errors.New("boom")
 
@@ -224,6 +226,36 @@ func TestConnect(t *testing.T) {
 				},
 			},
 			want: provErrors.GetSecretError(errBoom),
+		},
+		"ErrCleartextRequiresTLS": {
+			reason: "An error should be returned if allowCleartextPasswords is true but tls doesn't guarantee an encrypted connection",
+			fields: fields{
+				kube: &test.MockClient{
+					MockGet: test.NewMockGetFn(nil, func(obj client.Object) error {
+						switch o := obj.(type) {
+						case *v1alpha1.ProviderConfig:
+							o.Spec.Credentials.ConnectionSecretRef = common.LocalSecretReference{Name: "example"}
+							o.Spec.AllowCleartextPasswords = boolPtr(true)
+						}
+						return nil
+					}),
+				},
+				track: func(ctx context.Context, mg resource.ModernManaged) error { return nil },
+			},
+			args: args{
+				mg: &v1alpha1.User{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default"},
+					Spec: v1alpha1.UserSpec{
+						ManagedResourceSpec: xpv2.ManagedResourceSpec{
+							ProviderConfigReference: &common.ProviderConfigReference{
+								Kind: v1alpha1.ProviderConfigKind,
+								Name: "example",
+							},
+						},
+					},
+				},
+			},
+			want: errors.Wrap(mysql.ValidateAllowCleartextPasswords(nil, boolPtr(true)), errCleartext),
 		},
 	}
 
