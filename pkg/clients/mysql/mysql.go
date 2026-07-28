@@ -3,16 +3,17 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	// Blank-import the MySQL driver here so any caller of this package
-	// gets the "mysql" driver registered without relying on a transitive
-	// import from the reconciler or tls packages.
-	_ "github.com/go-sql-driver/mysql"
+	// Importing the MySQL driver registers the "mysql" driver via its
+	// init(); a named import also gives this package the Config/Connector
+	// types needed for the per-connection token-minting path.
+	mysqldriver "github.com/go-sql-driver/mysql"
 
 	"github.com/crossplane-contrib/provider-sql/pkg/clients/xsql"
 	"github.com/pkg/errors"
@@ -87,22 +88,43 @@ func getOrOpenPool(dsn string, cfg *ConnectionPoolConfig) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg != nil {
-		if cfg.MaxOpenConns != 0 {
-			db.SetMaxOpenConns(cfg.MaxOpenConns)
-		}
-		if cfg.MaxIdleConns != 0 {
-			db.SetMaxIdleConns(cfg.MaxIdleConns)
-		}
-		if cfg.ConnMaxLifetime > 0 {
-			db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
-		}
-		if cfg.ConnMaxIdleTime > 0 {
-			db.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
-		}
-	}
+	applyPoolConfig(db, cfg)
 	poolCache[dsn] = db
 	return db, nil
+}
+
+// getOrOpenPoolConnector is getOrOpenPool for a driver.Connector-backed pool
+// (sql.OpenDB) rather than a DSN string (sql.Open). key must be stable across
+// credential rotation so a rotating token does not create a new pool.
+func getOrOpenPoolConnector(key string, cfg *ConnectionPoolConfig, connector driver.Connector) *sql.DB {
+	poolCacheMu.Lock()
+	defer poolCacheMu.Unlock()
+	if db, ok := poolCache[key]; ok {
+		return db
+	}
+	db := sql.OpenDB(connector)
+	applyPoolConfig(db, cfg)
+	poolCache[key] = db
+	return db
+}
+
+// applyPoolConfig applies optional pool tuning; a nil cfg leaves Go defaults.
+func applyPoolConfig(db *sql.DB, cfg *ConnectionPoolConfig) {
+	if cfg == nil {
+		return
+	}
+	if cfg.MaxOpenConns != 0 {
+		db.SetMaxOpenConns(cfg.MaxOpenConns)
+	}
+	if cfg.MaxIdleConns != 0 {
+		db.SetMaxIdleConns(cfg.MaxIdleConns)
+	}
+	if cfg.ConnMaxLifetime > 0 {
+		db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+	}
+	if cfg.ConnMaxIdleTime > 0 {
+		db.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
+	}
 }
 
 // NewConnectionPoolConfig builds a ConnectionPoolConfig from plain
@@ -205,6 +227,94 @@ func NewWithConfig(creds map[string][]byte, tls *string, binlog *bool, cfg *Conn
 		db:       db,
 		openErr:  err,
 		dsn:      dsn,
+		endpoint: endpoint,
+		port:     port,
+		tls:      *tls,
+	}
+}
+
+// TokenMinter produces a short-lived database password on demand — e.g. an
+// AWS RDS IAM authentication token. It is invoked once per new physical
+// connection, so an expired token never blocks a fresh connect and the token
+// is never persisted in a DSN, a pool key, or a Kubernetes Secret.
+type TokenMinter interface {
+	Mint(ctx context.Context) (string, error)
+}
+
+// iamConnector is a database/sql/driver.Connector that mints a fresh password
+// for every physical connection via minter, then delegates to the
+// go-sql-driver connector built from the password-less base DSN.
+type iamConnector struct {
+	dsn    string // password-less DSN; carries host, tls, allowCleartextPasswords, timeout
+	minter TokenMinter
+	// newInner builds the delegate connector for a fully-resolved config.
+	// Overridable in tests to observe the config at the driver boundary
+	// without opening a real connection.
+	newInner func(*mysqldriver.Config) (driver.Connector, error)
+}
+
+func newMySQLConnector(cfg *mysqldriver.Config) (driver.Connector, error) {
+	return mysqldriver.NewConnector(cfg)
+}
+
+// Connect mints a fresh token and opens one physical connection with it.
+func (c *iamConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	token, err := c.minter.Mint(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot mint database auth token")
+	}
+	cfg, err := mysqldriver.ParseDSN(c.dsn)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot parse base DSN")
+	}
+	cfg.Passwd = token
+	inner, err := c.newInner(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return inner.Connect(ctx)
+}
+
+// Driver returns the underlying MySQL driver.
+func (c *iamConnector) Driver() driver.Driver { return mysqldriver.MySQLDriver{} }
+
+// NewWithMinter returns a MySQL client whose password is minted fresh for
+// every physical connection by minter, rather than read from creds. This is
+// the path for AWS RDS IAM database authentication: the password is a
+// ~15-minute token, so minting per-connect means an expired token never
+// blocks a new connection. The token never enters the DSN, the pool key, or
+// any Secret, so the pool is keyed by a password-less DSN and is NOT churned
+// when the token rotates — unlike the static-password path, where each
+// rotation lands a fresh pool.
+//
+// allowCleartextPasswords must be true for RDS IAM auth (the server requests
+// the mysql_clear_password plugin); ValidateAllowCleartextPasswords still
+// governs the TLS requirement.
+func NewWithMinter(creds map[string][]byte, tls *string, binlog *bool, cfg *ConnectionPoolConfig, allowCleartextPasswords *bool, minter TokenMinter) xsql.DB {
+	endpoint := string(creds[xpv1.ResourceCredentialsSecretEndpointKey])
+	port := string(creds[xpv1.ResourceCredentialsSecretPortKey])
+	username := string(creds[xpv1.ResourceCredentialsSecretUserKey])
+	if tls == nil {
+		defaultTLS := "preferred"
+		tls = &defaultTLS
+	}
+	var dialTimeout time.Duration
+	if cfg != nil {
+		dialTimeout = cfg.DialTimeout
+	}
+	// Password-less DSN: stable across token rotation. Serves as both the
+	// connector's base config and the pool key.
+	baseDSN := dsnWithTimeout(username, "", endpoint, port, *tls, binlog, dialTimeout, allowCleartextPasswords)
+	key := "iam:" + baseDSN
+
+	db := getOrOpenPoolConnector(key, cfg, &iamConnector{
+		dsn:      baseDSN,
+		minter:   minter,
+		newInner: newMySQLConnector,
+	})
+	return mySQLDB{
+		db:       db,
+		dsn:      key,
 		endpoint: endpoint,
 		port:     port,
 		tls:      *tls,

@@ -213,6 +213,104 @@ func TestConnect(t *testing.T) {
 	}
 }
 
+type stubMinter struct{}
+
+func (stubMinter) Mint(context.Context) (string, error) { return "tok", nil }
+
+// pcWithRDSAuth builds a MockClient that returns a ProviderConfig with the
+// RDSIAMAuth source (rdsAuth set unless withRDSAuth is false) plus a
+// connection secret carrying endpoint/port/username.
+func pcWithRDSAuth(withRDSAuth bool) client.Client {
+	return &test.MockClient{
+		MockGet: test.NewMockGetFn(nil, func(obj client.Object) error {
+			switch o := obj.(type) {
+			case *v1alpha1.ProviderConfig:
+				o.Spec.Credentials.Source = v1alpha1.CredentialsSourceRDSIAMAuth
+				o.Spec.Credentials.ConnectionSecretRef = &xpv1.SecretReference{}
+				o.Spec.TLS = ptrString("skip-verify")
+				o.Spec.AllowCleartextPasswords = boolPtr(true)
+				if withRDSAuth {
+					o.Spec.Credentials.RDSAuth = &v1alpha1.RDSAuthConfig{
+						Region:         "us-west-2",
+						AssumeRoleARNs: []string{"arn:aws:iam::123:role/trustee"},
+					}
+				}
+			case *corev1.Secret:
+				o.Data = map[string][]byte{
+					"endpoint": []byte("cluster.example.rds.amazonaws.com"),
+					"port":     []byte("3306"),
+					"username": []byte("iam_admin"),
+				}
+			}
+			return nil
+		}),
+	}
+}
+
+func TestConnectRDSIAMAuth(t *testing.T) {
+	nopUsage := func(ctx context.Context, mg resource.LegacyManaged) error { return nil }
+	mg := &v1alpha1.User{Spec: v1alpha1.UserSpec{ResourceSpec: xpv1.ResourceSpec{ProviderConfigReference: &xpv1.Reference{}}}}
+
+	t.Run("MintsFromRDSAuthConfig", func(t *testing.T) {
+		var gotRegion, gotEndpoint, gotUser string
+		var gotARNs []string
+		minterUsed := false
+		c := &connector{
+			kube:  pcWithRDSAuth(true),
+			track: nopUsage,
+			newMinter: func(_ context.Context, region, endpoint, dbUser string, arns []string) (mysql.TokenMinter, error) {
+				gotRegion, gotEndpoint, gotUser, gotARNs = region, endpoint, dbUser, arns
+				return stubMinter{}, nil
+			},
+			newDBWithMinter: func(_ map[string][]byte, _ *string, _ *bool, _ *mysql.ConnectionPoolConfig, _ *bool, m mysql.TokenMinter) xsql.DB {
+				minterUsed = m != nil
+				return mockDB{}
+			},
+		}
+		if _, err := c.Connect(context.Background(), mg); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gotRegion != "us-west-2" {
+			t.Errorf("region = %q, want us-west-2", gotRegion)
+		}
+		if gotEndpoint != "cluster.example.rds.amazonaws.com:3306" {
+			t.Errorf("endpoint = %q, want host:port joined", gotEndpoint)
+		}
+		if gotUser != "iam_admin" {
+			t.Errorf("dbUser = %q, want iam_admin", gotUser)
+		}
+		if len(gotARNs) != 1 || gotARNs[0] != "arn:aws:iam::123:role/trustee" {
+			t.Errorf("assumeRoleARNs = %v, want the trustee ARN", gotARNs)
+		}
+		if !minterUsed {
+			t.Error("newDBWithMinter must receive the minted TokenMinter")
+		}
+	})
+
+	t.Run("ErrMissingRDSAuth", func(t *testing.T) {
+		c := &connector{kube: pcWithRDSAuth(false), track: nopUsage}
+		_, err := c.Connect(context.Background(), mg)
+		if diff := cmp.Diff(errors.New(errNoRDSAuth), err, test.EquateErrors()); diff != "" {
+			t.Errorf("-want error, +got error:\n%s", diff)
+		}
+	})
+
+	t.Run("ErrBuildMinter", func(t *testing.T) {
+		errBoom := errors.New("assume-role denied")
+		c := &connector{
+			kube:  pcWithRDSAuth(true),
+			track: nopUsage,
+			newMinter: func(context.Context, string, string, string, []string) (mysql.TokenMinter, error) {
+				return nil, errBoom
+			},
+		}
+		_, err := c.Connect(context.Background(), mg)
+		if diff := cmp.Diff(errors.Wrap(errBoom, errBuildMinter), err, test.EquateErrors()); diff != "" {
+			t.Errorf("-want error, +got error:\n%s", diff)
+		}
+	})
+}
+
 func TestObserve(t *testing.T) {
 	errBoom := errors.New("boom")
 
