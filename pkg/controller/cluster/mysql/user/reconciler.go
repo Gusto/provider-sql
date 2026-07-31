@@ -19,6 +19,7 @@ package user
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/statemetrics"
@@ -40,6 +41,7 @@ import (
 
 	"github.com/crossplane-contrib/provider-sql/apis/cluster/mysql/v1alpha1"
 	"github.com/crossplane-contrib/provider-sql/pkg/clients/mysql"
+	"github.com/crossplane-contrib/provider-sql/pkg/clients/mysql/rdsauth"
 	"github.com/crossplane-contrib/provider-sql/pkg/clients/xsql"
 	"github.com/crossplane-contrib/provider-sql/pkg/controller/cluster/mysql/tls"
 )
@@ -51,6 +53,8 @@ const (
 	errGetSecret    = "cannot get credentials Secret"
 	errTLSConfig    = "cannot load TLS config"
 	errCleartext    = "invalid allowCleartextPasswords configuration"
+	errNoRDSAuth    = "ProviderConfig source is RDSIAMAuth but spec.credentials.rdsAuth is not set"
+	errBuildMinter  = "cannot build RDS IAM auth token minter"
 
 	errSelectUser              = "cannot select user"
 	errCreateUser              = "cannot create user"
@@ -68,7 +72,13 @@ func Setup(mgr ctrl.Manager, o xpcontroller.Options) error {
 	t := resource.NewLegacyProviderConfigUsageTracker(mgr.GetClient(), &v1alpha1.ProviderConfigUsage{})
 
 	reconcilerOptions := []managed.ReconcilerOption{
-		managed.WithTypedExternalConnector(&connector{kube: mgr.GetClient(), track: t.Track, newDB: mysql.NewWithConfig}),
+		managed.WithTypedExternalConnector(&connector{
+			kube:            mgr.GetClient(),
+			track:           t.Track,
+			newDB:           mysql.NewWithConfig,
+			newDBWithMinter: mysql.NewWithMinter,
+			newMinter:       defaultNewMinter,
+		}),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
@@ -96,12 +106,24 @@ func Setup(mgr ctrl.Manager, o xpcontroller.Options) error {
 }
 
 type connector struct {
-	kube  client.Client
-	track func(ctx context.Context, mg resource.LegacyManaged) error
-	newDB func(creds map[string][]byte, tls *string, binlog *bool, pool *mysql.ConnectionPoolConfig, allowCleartextPasswords *bool) xsql.DB
+	kube            client.Client
+	track           func(ctx context.Context, mg resource.LegacyManaged) error
+	newDB           func(creds map[string][]byte, tls *string, binlog *bool, pool *mysql.ConnectionPoolConfig, allowCleartextPasswords *bool) xsql.DB
+	newDBWithMinter func(creds map[string][]byte, tls *string, binlog *bool, pool *mysql.ConnectionPoolConfig, allowCleartextPasswords *bool, minter mysql.TokenMinter) xsql.DB
+	newMinter       func(ctx context.Context, region, endpoint, dbUser string, assumeRoleARNs []string) (mysql.TokenMinter, error)
 }
 
 var _ managed.TypedExternalConnector[*v1alpha1.User] = &connector{}
+
+// defaultNewMinter builds an RDS IAM auth token minter from the pod's ambient
+// AWS identity (IRSA / Pod Identity), optionally via an assume-role chain.
+func defaultNewMinter(ctx context.Context, region, endpoint, dbUser string, assumeRoleARNs []string) (mysql.TokenMinter, error) {
+	m, err := rdsauth.New(ctx, region, endpoint, dbUser, assumeRoleARNs)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
 
 func (c *connector) Connect(ctx context.Context, mg *v1alpha1.User) (managed.TypedExternalClient[*v1alpha1.User], error) {
 	if err := c.track(ctx, mg); err != nil {
@@ -116,9 +138,9 @@ func (c *connector) Connect(ctx context.Context, mg *v1alpha1.User) (managed.Typ
 		return nil, errors.Wrap(err, errGetPC)
 	}
 
-	// We don't need to check the credentials source because we currently only
-	// support one source (MySQLConnectionSecret), which is required and
-	// enforced by the ProviderConfig schema.
+	// Both sources read endpoint/port/username from the connection secret;
+	// they differ only in where the password comes from (a stored secret key
+	// vs. a per-connection minted RDS IAM token).
 	ref := pc.Spec.Credentials.ConnectionSecretRef
 	if ref == nil {
 		return nil, errors.New(errNoSecretRef)
@@ -140,10 +162,27 @@ func (c *connector) Connect(ctx context.Context, mg *v1alpha1.User) (managed.Typ
 	secretData := xsql.RemapCredentialKeys(s.Data, pc.Spec.Credentials.SecretKeyMapping.ToMap())
 	maxOpen, maxIdle, lifetime, idleTime, dialTimeout := pc.Spec.ConnectionPool.ToPoolValues()
 	poolCfg := mysql.NewConnectionPoolConfig(maxOpen, maxIdle, lifetime, idleTime, dialTimeout)
-	return &external{
-		db:   c.newDB(secretData, tlsName, mg.Spec.ForProvider.BinLog, poolCfg, pc.Spec.AllowCleartextPasswords),
-		kube: c.kube,
-	}, nil
+
+	var db xsql.DB
+	if pc.Spec.Credentials.Source == v1alpha1.CredentialsSourceRDSIAMAuth {
+		rds := pc.Spec.Credentials.RDSAuth
+		if rds == nil {
+			return nil, errors.New(errNoRDSAuth)
+		}
+		endpoint := net.JoinHostPort(
+			string(secretData[xpv1.ResourceCredentialsSecretEndpointKey]),
+			string(secretData[xpv1.ResourceCredentialsSecretPortKey]),
+		)
+		dbUser := string(secretData[xpv1.ResourceCredentialsSecretUserKey])
+		minter, err := c.newMinter(ctx, rds.Region, endpoint, dbUser, rds.AssumeRoleARNs)
+		if err != nil {
+			return nil, errors.Wrap(err, errBuildMinter)
+		}
+		db = c.newDBWithMinter(secretData, tlsName, mg.Spec.ForProvider.BinLog, poolCfg, pc.Spec.AllowCleartextPasswords, minter)
+	} else {
+		db = c.newDB(secretData, tlsName, mg.Spec.ForProvider.BinLog, poolCfg, pc.Spec.AllowCleartextPasswords)
+	}
+	return &external{db: db, kube: c.kube}, nil
 }
 
 type external struct {

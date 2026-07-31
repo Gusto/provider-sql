@@ -147,12 +147,19 @@ const (
 	// should acquire credentials from a connection secret written by a managed
 	// resource that represents a MySQL server.
 	CredentialsSourceMySQLConnectionSecret xpv1.CredentialsSource = "MySQLConnectionSecret"
+
+	// CredentialsSourceRDSIAMAuth indicates that the provider should
+	// authenticate to an AWS RDS/Aurora MySQL server using an IAM auth token
+	// minted per connection from the pod's ambient AWS identity (IRSA / Pod
+	// Identity). The connection secret still supplies endpoint/port/username;
+	// the password is minted, not read.
+	CredentialsSourceRDSIAMAuth xpv1.CredentialsSource = "RDSIAMAuth"
 )
 
 // ProviderCredentials required to authenticate.
 type ProviderCredentials struct {
 	// Source of the provider credentials.
-	// +kubebuilder:validation:Enum=MySQLConnectionSecret
+	// +kubebuilder:validation:Enum=MySQLConnectionSecret;RDSIAMAuth
 	Source xpv1.CredentialsSource `json:"source"`
 
 	// A CredentialsSecretRef is a reference to a MySQL connection secret
@@ -165,6 +172,24 @@ type ProviderCredentials struct {
 	// standard Crossplane keys are used: "endpoint", "port", "username", "password".
 	// +optional
 	SecretKeyMapping *SecretKeyMapping `json:"secretKeyMapping,omitempty"`
+
+	// RDSAuth configures AWS RDS IAM database authentication. Required when
+	// source is RDSIAMAuth, ignored otherwise.
+	// +optional
+	RDSAuth *RDSAuthConfig `json:"rdsAuth,omitempty"`
+}
+
+// RDSAuthConfig configures AWS RDS IAM database authentication.
+type RDSAuthConfig struct {
+	// Region is the AWS region of the target RDS/Aurora cluster.
+	Region string `json:"region"`
+
+	// AssumeRoleARNs is an optional ordered assume-role chain applied to the
+	// pod's ambient AWS credentials before minting the token, for
+	// cross-account access. Each role is assumed with the previous step's
+	// credentials.
+	// +optional
+	AssumeRoleARNs []string `json:"assumeRoleARNs,omitempty"`
 }
 
 // SecretKeyMapping allows overriding the default secret key names used to
